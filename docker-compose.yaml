@@ -84,6 +84,8 @@ x-airflow-common:
       condition: service_healthy
     postgres:
       condition: service_healthy
+  networks:
+    - airflow-network
 
 services:
   postgres:
@@ -102,6 +104,8 @@ services:
     restart: always
     ports:
       - "5432:5432"
+    networks:
+      - airflow-network
   
   pgadmin:
     container_name: pgadmin4_container2
@@ -112,6 +116,8 @@ services:
       PGADMIN_DEFAULT_PASSWORD: root
     ports:
       - "5050:80"
+    networks:
+      - airflow-network
 
   redis:
     # Redis is limited to 7.2-bookworm due to licencing change
@@ -126,6 +132,8 @@ services:
       retries: 50
       start_period: 30s
     restart: always
+    networks:
+      - airflow-network
 
   airflow-webserver:
     <<: *airflow-common
@@ -143,6 +151,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+    networks:
+      - airflow-network
 
   airflow-scheduler:
     <<: *airflow-common
@@ -260,6 +270,8 @@ services:
     user: "0:0"
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - airflow-network
 
   airflow-cli:
     <<: *airflow-common
@@ -295,6 +307,10 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+
+networks:
+  airflow-network:
+    driver: bridge
 
 volumes:
   postgres-db-volume:

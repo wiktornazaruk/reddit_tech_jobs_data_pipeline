@@ -1,4 +1,6 @@
 .env
+health_check.log
+health_check.sh
 config/
 venv/
 plugins/

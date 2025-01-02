@@ -56,7 +56,7 @@ def is_job_post(title: str) -> bool:
     }
 
     negative_job_keywords = {
-        'help', 'question', 'advice', 'discussion', 'meta', 'feedback', 'suggestion'
+        'help', 'question', 'advice', 'discussion', 'meta', 'feedback', 'suggestion', 'Looking for Data Engineering job'
     }
 
     title_lower = title.lower()
@@ -141,7 +141,35 @@ def extract_job_details(title: str) -> Dict[str, Any]:
 
     return job_details
 
-def scrape_reddit_posts(subreddit: str, start_datetime: datetime, end_datetime: datetime, ti, extra_check: int = 6) -> None:
+def get_date_range():
+    """Get the date range for data collection, including missed days"""
+    # Get the current time in UTC
+    now = datetime.now(timezone.utc)
+    
+    # Check for existing data to find last successful run
+    postgres_hook = PostgresHook(postgres_conn_id='jobs_connection')
+    
+    query = """
+    SELECT MAX(created_datetime) 
+    FROM posts 
+    WHERE created_datetime >= NOW() - INTERVAL '30 days'
+    """
+    
+    with postgres_hook.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            last_date = cur.fetchone()[0]
+    
+    if last_date is None:
+        # If no recent data, look back 7 days
+        start_date = now - timedelta(days=7)
+    else:
+        # Start from the last record's date
+        start_date = last_date
+        
+    return start_date, now
+
+def scrape_reddit_posts(ti, **context) -> None:
     """
     Scrapes Reddit posts from a specified subreddit within a given date range.
     Args:
@@ -151,7 +179,13 @@ def scrape_reddit_posts(subreddit: str, start_datetime: datetime, end_datetime: 
         ti (TaskInstance): Airflow task instance.
         extra_check (int): Number of additional posts to check.
     """
+    start_datetime, end_datetime = get_date_range()
+
     logging.info(f"Processing posts between {start_datetime} and {end_datetime}")
+
+    extra_check = 6
+
+    subreddit = 'dataengineeringjobs'
 
     url = f"https://old.reddit.com/r/{subreddit}/"
     headers = {
@@ -259,11 +293,11 @@ def scrape_reddit_posts(subreddit: str, start_datetime: datetime, end_datetime: 
 
 def process_job_posts(ti) -> None:
     """
-    Process raw Reddit posts into structured job posts.
+    Process raw Reddit posts into structured job posts with proper salary handling.
     Args:
         ti (TaskInstance): Airflow task instance.
     """
-    # Get raw posts directly from the extract task
+    # Try to get raw posts directly from the extract task
     raw_posts = ti.xcom_pull(task_ids='extract_reddit_posts')
     
     if not raw_posts:
@@ -288,19 +322,30 @@ def process_job_posts(ti) -> None:
     df.drop_duplicates(subset=['post_id', 'title'], inplace=True)
     logging.info(f"After removing duplicates: {len(df)} posts")
 
-    # Process salary information
+    # Process salary information with proper handling of None values
     salary_info = df['title'].apply(extract_salary_details)
-    df[['salary_currency', 'lower_salary', 'upper_salary']] = pd.DataFrame(
-        salary_info.tolist(),
-        index=df.index
-    )
+    
+    # Create empty columns first
+    df['salary_currency'] = None
+    df['lower_salary'] = None
+    df['upper_salary'] = None
+    
+    # Update only rows where salary_info is not None
+    for idx, salary_data in enumerate(salary_info):
+        if salary_data is not None:
+            df.at[idx, 'salary_currency'] = salary_data[0]
+            df.at[idx, 'lower_salary'] = salary_data[1]
+            df.at[idx, 'upper_salary'] = salary_data[2]
 
     # Process job details
     job_details = df['title'].apply(extract_job_details)
-    df = pd.concat([df, pd.DataFrame.from_records(job_details)], axis=1)
+    
+    # Convert job_details to DataFrame and concatenate
+    job_details_df = pd.DataFrame.from_records(job_details)
+    df = pd.concat([df, job_details_df], axis=1)
 
     # Filter valid job posts
-    df['is_valid_post'] = df['title'].apply(is_job_post) | df[['lower_salary', 'upper_salary']].notna().all(axis=1)
+    df['is_valid_post'] = df['title'].apply(is_job_post) | df[['lower_salary', 'upper_salary']].notna().any(axis=1)
     df = df[df['is_valid_post']].drop(columns=['is_valid_post'])
 
     if df.empty:
@@ -310,19 +355,13 @@ def process_job_posts(ti) -> None:
 
     logging.info(f"Processed {len(df)} job posts")
 
-    # Convert Timestamp objects to ISO format strings before serialization
+    # Convert any datetime objects to strings for JSON serialization
     if 'created_datetime' in df.columns:
         df['created_datetime'] = df['created_datetime'].apply(lambda x: x.isoformat() if pd.notnull(x) else None)
 
     # Convert DataFrame to dict and ensure all objects are JSON serializable
     posts_dict = df.to_dict('records')
     
-    # Convert any remaining Timestamp objects to strings
-    for post in posts_dict:
-        for key, value in post.items():
-            if isinstance(value, pd.Timestamp):
-                post[key] = value.isoformat()
-
     ti.xcom_push(key='posts', value=posts_dict)
 
 def insert_posts_into_postgres(ti) -> None:
@@ -409,6 +448,7 @@ dag = DAG(
     description='Fetch job posts from Reddit and store in Postgres',
     schedule_interval=timedelta(days=1),
     catchup=False,
+    max_active_runs=1
 )
 
 # Add documentation
@@ -436,11 +476,6 @@ Runs daily to collect the previous day's job posts.
 extract_reddit_posts_task = PythonOperator(
     task_id='extract_reddit_posts',
     python_callable=scrape_reddit_posts,
-    op_kwargs={
-        'subreddit': 'dataengineeringjobs',
-        'start_datetime': datetime.now(timezone.utc) - timedelta(days=1),
-        'end_datetime': datetime.now(timezone.utc),
-    },
     provide_context = True,
     dag=dag,
 )
